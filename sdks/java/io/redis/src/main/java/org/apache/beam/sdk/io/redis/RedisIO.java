@@ -22,6 +22,8 @@ import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Pr
 import com.google.auto.value.AutoValue;
 import java.util.List;
 import java.util.Map;
+import org.apache.beam.sdk.coders.Coder;
+import org.apache.beam.sdk.coders.CoderException;
 import org.apache.beam.sdk.coders.KvCoder;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
 import org.apache.beam.sdk.io.range.ByteKey;
@@ -36,6 +38,7 @@ import org.apache.beam.sdk.transforms.SerializableFunctions;
 import org.apache.beam.sdk.transforms.View;
 import org.apache.beam.sdk.transforms.display.DisplayData;
 import org.apache.beam.sdk.transforms.splittabledofn.RestrictionTracker;
+import org.apache.beam.sdk.util.CoderUtils;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PBegin;
 import org.apache.beam.sdk.values.PCollection;
@@ -172,11 +175,15 @@ public class RedisIO {
   }
 
   /** Write data to a Redis server. */
-  public static Write write() {
-    return new AutoValue_RedisIO_Write.Builder()
+  public static <keyT, valueT> Write<keyT, valueT> writeGeneric() {
+    return new AutoValue_RedisIO_Write.Builder<keyT, valueT>()
         .setConnectionConfiguration(RedisConnectionConfiguration.create())
         .setMethod(Write.Method.APPEND)
         .build();
+  }
+
+  public static Write<String, String> write() {
+    return RedisIO.writeGeneric();
   }
 
   /** Write stream data to a Redis server. */
@@ -439,7 +446,8 @@ public class RedisIO {
 
   /** A {@link PTransform} to write to a Redis server. */
   @AutoValue
-  public abstract static class Write extends PTransform<PCollection<KV<String, String>>, PDone> {
+  public abstract static class Write<keyT, valueT>
+      extends PTransform<PCollection<KV<keyT, valueT>>, PDone> {
 
     /** Determines the method used to insert data in Redis. */
     public enum Method {
@@ -486,22 +494,22 @@ public class RedisIO {
 
     abstract @Nullable Long expireTime();
 
-    abstract Builder toBuilder();
+    abstract Builder<keyT, valueT> toBuilder();
 
     @AutoValue.Builder
-    abstract static class Builder {
+    abstract static class Builder<keyT, valueT> {
 
-      abstract Builder setConnectionConfiguration(
+      abstract Builder<keyT, valueT> setConnectionConfiguration(
           RedisConnectionConfiguration connectionConfiguration);
 
-      abstract Builder setMethod(Method method);
+      abstract Builder<keyT, valueT> setMethod(Method method);
 
-      abstract Builder setExpireTime(Long expireTimeMillis);
+      abstract Builder<keyT, valueT> setExpireTime(Long expireTimeMillis);
 
-      abstract Write build();
+      abstract Write<keyT, valueT> build();
     }
 
-    public Write withEndpoint(String host, int port) {
+    public Write<keyT, valueT> withEndpoint(String host, int port) {
       checkArgument(host != null, "host can not be null");
       checkArgument(port > 0, "port can not be negative or 0");
       return toBuilder()
@@ -509,57 +517,71 @@ public class RedisIO {
           .build();
     }
 
-    public Write withAuth(String auth) {
+    public Write<keyT, valueT> withAuth(String auth) {
       checkArgument(auth != null, "auth can not be null");
       return toBuilder()
           .setConnectionConfiguration(connectionConfiguration().withAuth(auth))
           .build();
     }
 
-    public Write withTimeout(int timeout) {
+    public Write<keyT, valueT> withTimeout(int timeout) {
       checkArgument(timeout >= 0, "timeout can not be negative");
       return toBuilder()
           .setConnectionConfiguration(connectionConfiguration().withTimeout(timeout))
           .build();
     }
 
-    public Write withConnectionConfiguration(RedisConnectionConfiguration connection) {
+    public Write<keyT, valueT> withConnectionConfiguration(
+        RedisConnectionConfiguration connection) {
       checkArgument(connection != null, "connection can not be null");
       return toBuilder().setConnectionConfiguration(connection).build();
     }
 
-    public Write withMethod(Method method) {
+    public Write<keyT, valueT> withMethod(Method method) {
       checkArgument(method != null, "method can not be null");
       return toBuilder().setMethod(method).build();
     }
 
-    public Write withExpireTime(Long expireTimeMillis) {
+    public Write<keyT, valueT> withExpireTime(Long expireTimeMillis) {
       checkArgument(expireTimeMillis != null, "expireTimeMillis can not be null");
       checkArgument(expireTimeMillis > 0, "expireTimeMillis can not be negative or 0");
       return toBuilder().setExpireTime(expireTimeMillis).build();
     }
 
     @Override
-    public PDone expand(PCollection<KV<String, String>> input) {
+    public PDone expand(PCollection<KV<keyT, valueT>> input) {
       checkArgument(connectionConfiguration() != null, "withConnectionConfiguration() is required");
 
-      input.apply(ParDo.of(new WriteFn(this)));
+      Coder<KV<keyT, valueT>> inputCoder = input.getCoder();
+      if (!(inputCoder instanceof KvCoder)) {
+        throw new IllegalStateException("RedisIO.Write requires input to use KvCoder");
+      }
+
+      KvCoder<keyT, valueT> kvCoder = (KvCoder<keyT, valueT>) inputCoder;
+      Coder<keyT> keyCoder = kvCoder.getKeyCoder();
+      Coder<valueT> valueCoder = kvCoder.getValueCoder();
+
+      input.apply(ParDo.of(new WriteFn<>(this, keyCoder, valueCoder)));
       return PDone.in(input.getPipeline());
     }
 
-    private static class WriteFn extends DoFn<KV<String, String>, Void> {
+    private static class WriteFn<keyT, valueT> extends DoFn<KV<keyT, valueT>, Void> {
 
       private static final int DEFAULT_BATCH_SIZE = 1000;
 
-      private final Write spec;
+      private final Write<keyT, valueT> spec;
+      private final Coder<keyT> keyCoder;
+      private final Coder<valueT> valueCoder;
 
       private transient Jedis jedis;
       private transient @Nullable Transaction transaction;
 
       private int batchCount;
 
-      public WriteFn(Write spec) {
+      public WriteFn(Write<keyT, valueT> spec, Coder<keyT> keyCoder, Coder<valueT> valueCoder) {
         this.spec = spec;
+        this.keyCoder = keyCoder;
+        this.valueCoder = valueCoder;
       }
 
       @Setup
@@ -574,8 +596,8 @@ public class RedisIO {
       }
 
       @ProcessElement
-      public void processElement(ProcessContext c) {
-        KV<String, String> record = c.element();
+      public void processElement(ProcessContext c) throws CoderException {
+        KV<keyT, valueT> record = c.element();
 
         writeRecord(record);
 
@@ -588,39 +610,43 @@ public class RedisIO {
         }
       }
 
-      private void writeRecord(KV<String, String> record) {
+      private void writeRecord(KV<keyT, valueT> record) throws CoderException {
+        byte[] encodedKey = CoderUtils.encodeToByteArray(keyCoder, record.getKey());
+        byte[] encodedValue = CoderUtils.encodeToByteArray(valueCoder, record.getValue());
+        KV<byte[], byte[]> encodedRecord = KV.of(encodedKey, encodedValue);
+
         Method method = spec.method();
         Long expireTime = spec.expireTime();
 
         if (Method.APPEND == method) {
-          writeUsingAppendCommand(record, expireTime);
+          writeUsingAppendCommand(encodedRecord, expireTime);
         } else if (Method.SET == method) {
-          writeUsingSetCommand(record, expireTime);
+          writeUsingSetCommand(encodedRecord, expireTime);
         } else if (Method.LPUSH == method || Method.RPUSH == method) {
-          writeUsingListCommand(record, method, expireTime);
+          writeUsingListCommand(encodedRecord, method, expireTime);
         } else if (Method.SADD == method) {
-          writeUsingSaddCommand(record, expireTime);
+          writeUsingSaddCommand(encodedRecord, expireTime);
         } else if (Method.PFADD == method) {
-          writeUsingHLLCommand(record, expireTime);
+          writeUsingHLLCommand(encodedRecord, expireTime);
         } else if (Method.INCRBY == method) {
-          writeUsingIncrBy(record, expireTime);
+          writeUsingIncrBy(encodedRecord, record.getValue(), expireTime);
         } else if (Method.DECRBY == method) {
-          writeUsingDecrBy(record, expireTime);
+          writeUsingDecrBy(encodedRecord, record.getValue(), expireTime);
         }
       }
 
-      private void writeUsingAppendCommand(KV<String, String> record, Long expireTime) {
-        String key = record.getKey();
-        String value = record.getValue();
+      private void writeUsingAppendCommand(KV<byte[], byte[]> record, Long expireTime) {
+        byte[] key = record.getKey();
+        byte[] value = record.getValue();
 
         transaction.append(key, value);
 
         setExpireTimeWhenRequired(key, expireTime);
       }
 
-      private void writeUsingSetCommand(KV<String, String> record, Long expireTime) {
-        String key = record.getKey();
-        String value = record.getValue();
+      private void writeUsingSetCommand(KV<byte[], byte[]> record, Long expireTime) {
+        byte[] key = record.getKey();
+        byte[] value = record.getValue();
 
         if (expireTime != null) {
           transaction.psetex(key, expireTime, value);
@@ -630,10 +656,10 @@ public class RedisIO {
       }
 
       private void writeUsingListCommand(
-          KV<String, String> record, Method method, Long expireTime) {
+          KV<byte[], byte[]> record, Method method, Long expireTime) {
 
-        String key = record.getKey();
-        String value = record.getValue();
+        byte[] key = record.getKey();
+        byte[] value = record.getValue();
 
         if (Method.LPUSH == method) {
           transaction.lpush(key, value);
@@ -644,43 +670,43 @@ public class RedisIO {
         setExpireTimeWhenRequired(key, expireTime);
       }
 
-      private void writeUsingSaddCommand(KV<String, String> record, Long expireTime) {
-        String key = record.getKey();
-        String value = record.getValue();
+      private void writeUsingSaddCommand(KV<byte[], byte[]> record, Long expireTime) {
+        byte[] key = record.getKey();
+        byte[] value = record.getValue();
 
         transaction.sadd(key, value);
 
         setExpireTimeWhenRequired(key, expireTime);
       }
 
-      private void writeUsingHLLCommand(KV<String, String> record, Long expireTime) {
-        String key = record.getKey();
-        String value = record.getValue();
+      private void writeUsingHLLCommand(KV<byte[], byte[]> record, Long expireTime) {
+        byte[] key = record.getKey();
+        byte[] value = record.getValue();
 
         transaction.pfadd(key, value);
 
         setExpireTimeWhenRequired(key, expireTime);
       }
 
-      private void writeUsingIncrBy(KV<String, String> record, Long expireTime) {
-        String key = record.getKey();
-        String value = record.getValue();
-        long inc = Long.parseLong(value);
+      private void writeUsingIncrBy(KV<byte[], byte[]> record, valueT value, Long expireTime) {
+        byte[] key = record.getKey();
+        Long inc = parseLong(value);
+
         transaction.incrBy(key, inc);
 
         setExpireTimeWhenRequired(key, expireTime);
       }
 
-      private void writeUsingDecrBy(KV<String, String> record, Long expireTime) {
-        String key = record.getKey();
-        String value = record.getValue();
-        long decr = Long.parseLong(value);
-        transaction.decrBy(key, decr);
+      private void writeUsingDecrBy(KV<byte[], byte[]> record, valueT value, Long expireTime) {
+        byte[] key = record.getKey();
+        Long inc = parseLong(value);
+
+        transaction.decrBy(key, inc);
 
         setExpireTimeWhenRequired(key, expireTime);
       }
 
-      private void setExpireTimeWhenRequired(String key, Long expireTime) {
+      private void setExpireTimeWhenRequired(byte[] key, Long expireTime) {
         if (expireTime != null) {
           transaction.pexpire(key, expireTime);
         }
@@ -701,6 +727,17 @@ public class RedisIO {
       @Teardown
       public void teardown() {
         jedis.close();
+      }
+    }
+
+    private static <valueT> long parseLong(valueT value) {
+      if (value instanceof String) {
+        return Long.parseLong((String) value);
+      } else if (value instanceof Long) {
+        return (Long) value;
+      } else {
+        throw new IllegalArgumentException(
+            "INCRBY/DECRBY method requires value to be of type String or Long");
       }
     }
   }
