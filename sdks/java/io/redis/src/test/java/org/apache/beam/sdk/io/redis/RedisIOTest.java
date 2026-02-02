@@ -21,7 +21,9 @@ import static java.util.stream.Collectors.toList;
 import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists.transform;
 import static org.hamcrest.CoreMatchers.hasItems;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 import java.util.ArrayList;
@@ -33,6 +35,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
+import org.apache.beam.sdk.Pipeline.PipelineExecutionException;
 import org.apache.beam.sdk.coders.KvCoder;
 import org.apache.beam.sdk.coders.MapCoder;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
@@ -181,7 +184,7 @@ public class RedisIOTest {
 
     assertEquals(newValue, client.get(key));
     Long expireTime = client.pttl(key);
-    assertTrue(expireTime.toString(), 9_000 <= expireTime && expireTime <= 10_0000);
+    assertTrue(expireTime.toString(), 9_000 <= expireTime && expireTime <= 10_000);
     client.del(key);
   }
 
@@ -262,7 +265,7 @@ public class RedisIOTest {
     long count = client.pfcount(key);
     assertEquals(6, count);
     Long expireTime = client.pttl(key);
-    assertTrue(expireTime.toString(), 9_000 <= expireTime && expireTime <= 10_0000);
+    assertTrue(expireTime.toString(), 9_000 <= expireTime && expireTime <= 10_000);
     client.del(key);
   }
 
@@ -295,6 +298,248 @@ public class RedisIOTest {
 
     long count = Long.parseLong(client.get(key));
     assertEquals(-1, count);
+  }
+
+  @Test
+  public void testWriteGenericWithMethodSet() {
+    byte[] key = {1};
+    client.set(key, new byte[] {1});
+
+    byte[] newValue = {2};
+    PCollection<KV<byte[], byte[]>> write = p.apply(Create.of(KV.of(key, newValue)));
+    write.apply(
+        RedisIO.<byte[], byte[]>writeGeneric()
+            .withEndpoint(REDIS_HOST, port)
+            .withMethod(Method.SET));
+    p.run();
+
+    assertArrayEquals(newValue, client.get(key));
+    assertEquals(NO_EXPIRATION, Long.valueOf(client.ttl(key)));
+  }
+
+  @Test
+  public void testWriteGenericWithMethodSetWithExpiration() {
+    byte[] key = {2};
+    client.set(key, new byte[] {1});
+
+    byte[] newValue = {2};
+
+    PCollection<KV<byte[], byte[]>> write = p.apply(Create.of(KV.of(key, newValue)));
+    write.apply(
+        RedisIO.<byte[], byte[]>writeGeneric()
+            .withEndpoint(REDIS_HOST, port)
+            .withMethod(Method.SET)
+            .withExpireTime(10_000L));
+    p.run();
+
+    assertArrayEquals(newValue, client.get(key));
+    Long expireTime = client.pttl(key);
+    assertTrue(expireTime.toString(), 9_000 <= expireTime && expireTime <= 10_000);
+    client.del(key);
+  }
+
+  @Test
+  public void testWriteGenericWithMethodLPush() {
+    byte[] key = {3};
+    byte[] value = {1};
+    client.lpush(key, value);
+
+    byte[] newValue = {2};
+    PCollection<KV<byte[], byte[]>> write = p.apply(Create.of(KV.of(key, newValue)));
+    write.apply(
+        RedisIO.<byte[], byte[]>writeGeneric()
+            .withEndpoint(REDIS_HOST, port)
+            .withMethod(Method.LPUSH));
+    p.run();
+
+    List<byte[]> values = client.lrange(key, 0, -1);
+    List<byte[]> expected = Arrays.asList(new byte[] {2}, new byte[] {1});
+    assertEquals(expected.size(), values.size());
+    for (int i = 0; i < expected.size(); i++) {
+      assertArrayEquals(expected.get(i), values.get(i));
+    }
+  }
+
+  @Test
+  public void testWriteGenericWithMethodRPush() {
+    byte[] key = {4};
+    byte[] value = {1};
+    client.lpush(key, value);
+
+    byte[] newValue = {2};
+    PCollection<KV<byte[], byte[]>> write = p.apply(Create.of(KV.of(key, newValue)));
+    write.apply(
+        RedisIO.<byte[], byte[]>writeGeneric()
+            .withEndpoint(REDIS_HOST, port)
+            .withMethod(Method.RPUSH));
+    p.run();
+
+    List<byte[]> values = client.lrange(key, 0, -1);
+    List<byte[]> expected = Arrays.asList(new byte[] {1}, new byte[] {2});
+    assertEquals(expected.size(), values.size());
+    for (int i = 0; i < expected.size(); i++) {
+      assertArrayEquals(expected.get(i), values.get(i));
+    }
+  }
+
+  @Test
+  public void testWriteGenericWithMethodSAdd() {
+    byte[] key = {5};
+    List<byte[]> values =
+        Arrays.asList(
+            new byte[] {0},
+            new byte[] {1},
+            new byte[] {2},
+            new byte[] {3},
+            new byte[] {2},
+            new byte[] {4},
+            new byte[] {0},
+            new byte[] {5});
+    List<KV<byte[], byte[]>> data = buildConstantKeyList(key, values);
+
+    PCollection<KV<byte[], byte[]>> write = p.apply(Create.of(data));
+    write.apply(
+        RedisIO.<byte[], byte[]>writeGeneric()
+            .withEndpoint(REDIS_HOST, port)
+            .withMethod(Method.SADD));
+    p.run();
+
+    Set<byte[]> members = client.smembers(key);
+    assertEquals(6, members.size());
+    for (byte[] expectedArray : values) {
+      boolean found = false;
+      for (byte[] actualArray : members) {
+        if (Arrays.equals(expectedArray, actualArray)) {
+          found = true;
+          break;
+        }
+      }
+      assertTrue(found);
+    }
+  }
+
+  @Test
+  public void testWriteGenericWithMethodPFAdd() {
+    byte[] key = {6};
+    List<byte[]> values =
+        Arrays.asList(
+            new byte[] {0},
+            new byte[] {1},
+            new byte[] {2},
+            new byte[] {3},
+            new byte[] {2},
+            new byte[] {4},
+            new byte[] {0},
+            new byte[] {5});
+    List<KV<byte[], byte[]>> data = buildConstantKeyList(key, values);
+
+    PCollection<KV<byte[], byte[]>> write = p.apply(Create.of(data));
+    write.apply(
+        RedisIO.<byte[], byte[]>writeGeneric()
+            .withEndpoint(REDIS_HOST, port)
+            .withMethod(Method.PFADD));
+    p.run();
+
+    long count = client.pfcount(key);
+    assertEquals(6, count);
+    assertEquals(NO_EXPIRATION, Long.valueOf(client.ttl(key)));
+  }
+
+  @Test
+  public void testWriteGenericWithMethodPFAddWithExpireTime() {
+    byte[] key = {6};
+    List<byte[]> values =
+        Arrays.asList(
+            new byte[] {0},
+            new byte[] {1},
+            new byte[] {2},
+            new byte[] {3},
+            new byte[] {2},
+            new byte[] {4},
+            new byte[] {0},
+            new byte[] {5});
+    List<KV<byte[], byte[]>> data = buildConstantKeyList(key, values);
+
+    PCollection<KV<byte[], byte[]>> write = p.apply(Create.of(data));
+    write.apply(
+        RedisIO.<byte[], byte[]>writeGeneric()
+            .withEndpoint(REDIS_HOST, port)
+            .withMethod(Method.PFADD)
+            .withExpireTime(10_000L));
+    p.run();
+
+    long count = client.pfcount(key);
+    assertEquals(6, count);
+    Long expireTime = client.pttl(key);
+    assertTrue(expireTime.toString(), 9_000 <= expireTime && expireTime <= 10_000);
+    client.del(key);
+  }
+
+  @Test
+  public void testWriteGenericUsingINCRBY() {
+    String key = "key_incr_generic";
+    List<Long> values = Arrays.asList(0L, 1L, 2L, -3L, 2L, 4L, 0L, 5L);
+    List<KV<String, Long>> data = buildConstantKeyList(key, values);
+
+    PCollection<KV<String, Long>> write = p.apply(Create.of(data));
+    write.apply(
+        RedisIO.<String, Long>writeGeneric()
+            .withEndpoint(REDIS_HOST, port)
+            .withMethod(Method.INCRBY));
+
+    p.run();
+
+    long count = Long.parseLong(client.get(key));
+    assertEquals(11, count);
+  }
+
+  @Test
+  public void testWriteGenericUsingINCRBYwithIllegalInputFails() {
+    String key = "key_incr_generic";
+    List<Double> values = Arrays.asList(0.2);
+    List<KV<String, Double>> data = buildConstantKeyList(key, values);
+
+    PCollection<KV<String, Double>> write = p.apply(Create.of(data));
+    write.apply(
+        RedisIO.<String, Double>writeGeneric()
+            .withEndpoint(REDIS_HOST, port)
+            .withMethod(Method.INCRBY));
+
+    assertThrows(PipelineExecutionException.class, () -> p.run());
+  }
+
+  @Test
+  public void testWriteGenericUsingDECRBY() {
+    String key = "key_decr_generic";
+
+    List<Long> values = Arrays.asList(-10L, 1L, 2L, -3L, 2L, 4L, 0L, 5L);
+    List<KV<String, Long>> data = buildConstantKeyList(key, values);
+
+    PCollection<KV<String, Long>> write = p.apply(Create.of(data));
+    write.apply(
+        RedisIO.<String, Long>writeGeneric()
+            .withEndpoint(REDIS_HOST, port)
+            .withMethod(Method.DECRBY));
+
+    p.run();
+
+    long count = Long.parseLong(client.get(key));
+    assertEquals(-1, count);
+  }
+
+  @Test
+  public void testWriteGenericUsingDECRBYwithIllegalInputFails() {
+    String key = "key_decr_generic";
+    List<Double> values = Arrays.asList(0.2);
+    List<KV<String, Double>> data = buildConstantKeyList(key, values);
+
+    PCollection<KV<String, Double>> write = p.apply(Create.of(data));
+    write.apply(
+        RedisIO.<String, Double>writeGeneric()
+            .withEndpoint(REDIS_HOST, port)
+            .withMethod(Method.DECRBY));
+
+    assertThrows(PipelineExecutionException.class, () -> p.run());
   }
 
   @Test
@@ -400,9 +645,9 @@ public class RedisIOTest {
     assertEquals("1885267", redisCursor.getCursor());
   }
 
-  private static List<KV<String, String>> buildConstantKeyList(String key, List<String> values) {
-    List<KV<String, String>> data = new ArrayList<>();
-    for (String value : values) {
+  private static <K, V> List<KV<K, V>> buildConstantKeyList(K key, List<V> values) {
+    List<KV<K, V>> data = new ArrayList<>();
+    for (V value : values) {
       data.add(KV.of(key, value));
     }
     return data;
