@@ -622,40 +622,33 @@ public class RedisIO {
       private void writeRecord(KV<keyT, valueT> record) throws CoderException {
         byte[] encodedKey = CoderUtils.encodeToByteArray(keyCoder, record.getKey());
         byte[] encodedValue = CoderUtils.encodeToByteArray(valueCoder, record.getValue());
-        KV<byte[], byte[]> encodedRecord = KV.of(encodedKey, encodedValue);
 
         Method method = spec.method();
         Long expireTime = spec.expireTime();
 
         if (Method.APPEND == method) {
-          writeUsingAppendCommand(encodedRecord, expireTime);
+          writeUsingAppendCommand(encodedKey, encodedValue, expireTime);
         } else if (Method.SET == method) {
-          writeUsingSetCommand(encodedRecord, expireTime);
+          writeUsingSetCommand(encodedKey, encodedValue, expireTime);
         } else if (Method.LPUSH == method || Method.RPUSH == method) {
-          writeUsingListCommand(encodedRecord, method, expireTime);
+          writeUsingListCommand(encodedKey, encodedValue, method, expireTime);
         } else if (Method.SADD == method) {
-          writeUsingSaddCommand(encodedRecord, expireTime);
+          writeUsingSaddCommand(encodedKey, encodedValue, expireTime);
         } else if (Method.PFADD == method) {
-          writeUsingHLLCommand(encodedRecord, expireTime);
+          writeUsingHLLCommand(encodedKey, encodedValue, expireTime);
         } else if (Method.INCRBY == method) {
-          writeUsingIncrBy(encodedRecord, record.getValue(), expireTime);
+          writeUsingIncrBy(encodedKey, record.getValue(), expireTime);
         } else if (Method.DECRBY == method) {
-          writeUsingDecrBy(encodedRecord, record.getValue(), expireTime);
+          writeUsingDecrBy(encodedKey, record.getValue(), expireTime);
         }
       }
 
-      private void writeUsingAppendCommand(KV<byte[], byte[]> record, Long expireTime) {
-        byte[] key = record.getKey();
-        byte[] value = record.getValue();
-
+      private void writeUsingAppendCommand(byte[] key, byte[] value, Long expireTime) {
         transaction.append(key, value);
-
         setExpireTimeWhenRequired(key, expireTime);
       }
 
-      private void writeUsingSetCommand(KV<byte[], byte[]> record, Long expireTime) {
-        byte[] key = record.getKey();
-        byte[] value = record.getValue();
+      private void writeUsingSetCommand(byte[] key, byte[] value, Long expireTime) {
 
         if (expireTime != null) {
           transaction.psetex(key, expireTime, value);
@@ -664,11 +657,7 @@ public class RedisIO {
         }
       }
 
-      private void writeUsingListCommand(
-          KV<byte[], byte[]> record, Method method, Long expireTime) {
-
-        byte[] key = record.getKey();
-        byte[] value = record.getValue();
+      private void writeUsingListCommand(byte[] key, byte[] value, Method method, Long expireTime) {
 
         if (Method.LPUSH == method) {
           transaction.lpush(key, value);
@@ -679,26 +668,19 @@ public class RedisIO {
         setExpireTimeWhenRequired(key, expireTime);
       }
 
-      private void writeUsingSaddCommand(KV<byte[], byte[]> record, Long expireTime) {
-        byte[] key = record.getKey();
-        byte[] value = record.getValue();
-
+      private void writeUsingSaddCommand(byte[] key, byte[] value, Long expireTime) {
         transaction.sadd(key, value);
 
         setExpireTimeWhenRequired(key, expireTime);
       }
 
-      private void writeUsingHLLCommand(KV<byte[], byte[]> record, Long expireTime) {
-        byte[] key = record.getKey();
-        byte[] value = record.getValue();
-
+      private void writeUsingHLLCommand(byte[] key, byte[] value, Long expireTime) {
         transaction.pfadd(key, value);
 
         setExpireTimeWhenRequired(key, expireTime);
       }
 
-      private void writeUsingIncrBy(KV<byte[], byte[]> record, valueT value, Long expireTime) {
-        byte[] key = record.getKey();
+      private void writeUsingIncrBy(byte[] key, valueT value, Long expireTime) {
         Long inc = parseLong(value);
 
         transaction.incrBy(key, inc);
@@ -706,11 +688,10 @@ public class RedisIO {
         setExpireTimeWhenRequired(key, expireTime);
       }
 
-      private void writeUsingDecrBy(KV<byte[], byte[]> record, valueT value, Long expireTime) {
-        byte[] key = record.getKey();
-        Long inc = parseLong(value);
+      private void writeUsingDecrBy(byte[] key, valueT value, Long expireTime) {
+        Long decr = parseLong(value);
 
-        transaction.decrBy(key, inc);
+        transaction.decrBy(key, decr);
 
         setExpireTimeWhenRequired(key, expireTime);
       }
