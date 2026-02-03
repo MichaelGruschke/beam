@@ -109,6 +109,15 @@ import redis.clients.jedis.resps.ScanResult;
  *
  * }</pre>
  *
+ * <p>Using generic write the KV pair is serialized with the underlying coder:
+ *
+ * <pre>{@code
+ * pipeline.apply(...)
+ *   // here we a have a PCollection<byte[], byte[]> with key/value pairs
+ *   .apply(RedisIO.<byte[], byte[]>writeGeneric().withEndpoint("::1", 6379))
+ *
+ * }</pre>
+ *
  * <h3>Writing Redis Streams</h3>
  *
  * <p>{@link #writeStreams()} appends the entries of a {@link PCollection} of key/value pairs
